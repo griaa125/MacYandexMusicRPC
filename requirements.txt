@@ -1,0 +1,27 @@
+# MacYandexMusicRPC — macOS requirements
+# Install with: pip install -r requirements.txt
+
+# Discord Rich Presence
+pypresence @ git+https://github.com/qwertyquerty/pypresence.git
+
+# Yandex Music API
+yandex-music
+
+# System tray (cross-platform, macOS supported)
+pystray
+
+# GUI for Yandex OAuth token retrieval
+PyQt6
+PyQt6-WebEngine
+
+# Utilities
+packaging
+requests
+colorama
+keyring
+Pillow
+psutil
+
+# Optional: install via Homebrew for best Now Playing support:
+#   brew install nowplaying-cli
+# Without it, the app falls back to AppleScript queries.
