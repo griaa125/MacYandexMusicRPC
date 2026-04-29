@@ -905,13 +905,19 @@ if __name__ == '__main__':
 
     # Presence in background with watchdog
     def _watchdog():
-        while True:
+        crash_count = 0
+        max_crashes = 10
+        while crash_count < max_crashes:
             th = threading.Thread(target=Presence.start, daemon=True)
             th.start()
             th.join()
-            log(t("Presence thread crashed, restarting in 5s...",
-                  "Поток Presence упал, перезапуск через 5с..."), LogType.Error)
-            time.sleep(5)
+            crash_count += 1
+            delay = min(5 * crash_count, 60)
+            log(t(f"Presence thread crashed ({crash_count}/{max_crashes}), restarting in {delay}s...",
+                  f"Поток Presence упал ({crash_count}/{max_crashes}), перезапуск через {delay}с..."), LogType.Error)
+            time.sleep(delay)
+        log(t("Presence thread crashed too many times, giving up.",
+              "Поток Presence упал слишком много раз, остановка."), LogType.Error)
 
     threading.Thread(target=_watchdog, daemon=True).start()
 
