@@ -1,116 +1,149 @@
 """
-mac_media.py — macOS Now Playing info via nowplaying-cli or AppleScript.
-
-Install nowplaying-cli for best results:
-    brew install nowplaying-cli
+mac_media.py — macOS Now Playing info via osascript only.
+No direct subprocess calls to external binaries from .app — no process leaks.
 """
 
 import subprocess
 from datetime import timedelta
 
 
-def _run(cmd: list, timeout=5):
+def _run_osascript(script: str, timeout=8):
+    """Run AppleScript via osascript. Guaranteed cleanup via finally."""
+    proc = None
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout.strip() if r.returncode == 0 else None
+        proc = subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            close_fds=True
+        )
+        stdout, _ = proc.communicate(timeout=timeout)
+        return stdout.strip() if proc.returncode == 0 else None
     except Exception:
         return None
-
-
-def _run_osascript(script: str):
-    return _run(["osascript", "-e", script])
+    finally:
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
 # ---------------------------------------------------------------------------
-# nowplaying-cli (brew install nowplaying-cli)
+# nowplaying-cli called via osascript "do shell script"
+# This way only ONE osascript process is spawned, not nowplaying-cli directly
 # ---------------------------------------------------------------------------
 
-def _via_nowplaying_cli():
-    """Use nowplaying-cli to get current track info."""
-    def get(field):
-        out = _run(["nowplaying-cli", "get", field])
-        return (out or "").strip()
-
-    title = get("title")
-    if not title or title == "(null)":
+def _via_nowplaying_osascript():
+    """Call nowplaying-cli through osascript to avoid PyInstaller process leak."""
+    script = '''
+set fields to {"title", "artist", "album", "duration", "elapsedTime", "playbackRate", "bundleIdentifier"}
+set cmd to "/usr/local/bin/nowplaying-cli get"
+repeat with f in fields
+    set cmd to cmd & " " & f
+end repeat
+try
+    return do shell script cmd
+on error
+    return ""
+end try
+'''
+    out = _run_osascript(script)
+    if not out:
         return None
 
-    artist   = get("artist")
-    album    = get("album")
-    dur_s    = get("duration")
-    elap_s   = get("elapsedTime")
-    rate_s   = get("playbackRate")
+    parts = out.splitlines()
+    if len(parts) < 7:
+        parts += [""] * (7 - len(parts))
 
-    def safe_float(s):
+    def v(s):
+        s = (s or "").strip()
+        return "" if s in ("(null)", "null") else s
+
+    title = v(parts[0])
+    if not title:
+        return None
+
+    def sf(s):
         try:
-            return float(s) if s and s != "(null)" else 0.0
+            val = v(s)
+            return float(val) if val else 0.0
         except ValueError:
             return 0.0
 
-    duration = safe_float(dur_s)
-    elapsed  = safe_float(elap_s)
-    rate     = safe_float(rate_s)
-    state    = "Playing" if rate > 0 else "Paused"
-
+    rate = sf(parts[5])
     return {
         "title":        title,
-        "artist":       artist if artist and artist != "(null)" else "",
-        "album":        album  if album  and album  != "(null)" else "",
-        "duration_sec": duration,
-        "elapsed_sec":  elapsed,
-        "state":        state,
-        "app_name":     get("bundleIdentifier") or "Unknown",
+        "artist":       v(parts[1]),
+        "album":        v(parts[2]),
+        "duration_sec": sf(parts[3]),
+        "elapsed_sec":  sf(parts[4]),
+        "state":        "Playing" if rate > 0 else "Paused",
+        "app_name":     v(parts[6]) or "Unknown",
     }
 
 
 # ---------------------------------------------------------------------------
-# AppleScript fallback for known apps
+# AppleScript fallback — all apps checked in ONE osascript call
 # ---------------------------------------------------------------------------
 
 _APPS = ["Yandex Music", "Spotify", "Music", "VOX"]
 
 
 def _via_applescript():
-    for app in _APPS:
-        is_running = _run_osascript(
-            f'tell application "System Events" to return (name of processes) contains "{app}"'
-        )
-        if not is_running or is_running.lower() != "true":
-            continue
+    """Check all known apps in a single osascript call."""
+    apps_list = '{"' + '", "'.join(_APPS) + '"}'
+    script = f'''
+set appList to {apps_list}
+repeat with appName in appList
+    tell application "System Events"
+        set isRunning to (name of processes) contains appName
+    end tell
+    if isRunning then
+        tell application appName
+            try
+                set t to name of current track
+                set ar to artist of current track
+                set al to album of current track
+                set dur to duration of current track
+                set pos to player position
+                set st to player state as string
+                return t & "|||" & ar & "|||" & al & "|||" & (dur as string) & "|||" & (pos as string) & "|||" & st & "|||" & appName
+            end try
+        end tell
+    end if
+end repeat
+return ""
+'''
+    out = _run_osascript(script)
+    if not out or "|||" not in out:
+        return None
 
-        out = _run_osascript(f'''
-tell application "{app}"
-    try
-        set t to name of current track
-        set ar to artist of current track
-        set al to album of current track
-        set dur to duration of current track
-        set pos to player position
-        set st to player state as string
-        return t & "|||" & ar & "|||" & al & "|||" & (dur as string) & "|||" & (pos as string) & "|||" & st
-    end try
-end tell
-''')
-        if out and "|||" in out:
-            parts = out.split("|||")
-            if len(parts) >= 6:
-                title, artist, album, dur_s, pos_s, state_s = [p.strip() for p in parts[:6]]
-                def sf(s):
-                    try: return float(s)
-                    except: return 0.0
-                sl = state_s.lower()
-                state = "Playing" if "play" in sl else "Paused" if "paus" in sl else "Stopped"
-                if title:
-                    return {
-                        "title":        title,
-                        "artist":       artist,
-                        "album":        album,
-                        "duration_sec": sf(dur_s),
-                        "elapsed_sec":  sf(pos_s),
-                        "state":        state,
-                        "app_name":     app,
-                    }
-    return None
+    parts = out.split("|||")
+    if len(parts) < 6:
+        return None
+
+    title, artist, album, dur_s, pos_s, state_s = [p.strip() for p in parts[:6]]
+    app_name = parts[6].strip() if len(parts) > 6 else "Unknown"
+
+    def sf(s):
+        try: return float(s)
+        except: return 0.0
+
+    sl = state_s.lower()
+    state = "Playing" if "play" in sl else "Paused" if "paus" in sl else "Stopped"
+
+    if not title:
+        return None
+
+    return {
+        "title":        title,
+        "artist":       artist,
+        "album":        album,
+        "duration_sec": sf(dur_s),
+        "elapsed_sec":  sf(pos_s),
+        "state":        state,
+        "app_name":     app_name,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +156,7 @@ def get_media_info():
     position (timedelta), session_title, app_name, duration_sec.
     Returns None if nothing is playing.
     """
-    info = _via_nowplaying_cli()
+    info = _via_nowplaying_osascript()
     if info is None:
         info = _via_applescript()
     if info is None:
@@ -146,12 +179,25 @@ def get_media_info():
 
 
 def get_session_ids():
-    """Return list of currently running music app names."""
-    running = []
-    for app in _APPS:
-        out = _run_osascript(
-            f'tell application "System Events" to return (name of processes) contains "{app}"'
-        )
-        if out and out.strip().lower() == "true":
-            running.append(app)
-    return running
+    """Return list of currently running music app names — single osascript call."""
+    apps_list = '{"' + '", "'.join(_APPS) + '"}'
+    script = f'''
+set appList to {apps_list}
+set running to {{}}
+repeat with appName in appList
+    tell application "System Events"
+        if (name of processes) contains appName then
+            set end of running to appName
+        end if
+    end tell
+end repeat
+set out to ""
+repeat with a in running
+    set out to out & a & "\\n"
+end repeat
+return out
+'''
+    out = _run_osascript(script)
+    if not out:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
